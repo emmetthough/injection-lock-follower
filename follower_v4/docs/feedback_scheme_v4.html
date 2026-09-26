@@ -1,0 +1,406 @@
+<meta charset="utf-8">
+<title>Injection lock follower — feedback scheme v4</title>
+<style>
+  :root { --ink:#2c2c2a; --ink2:#5f5e5a; --ink3:#888780; --rule:#d3d1c7; --bg:#fdfdfc; }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:48px 24px 96px; background:var(--bg); color:var(--ink);
+         font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+  main { max-width: 760px; margin:0 auto; }
+  h1 { font-size:28px; font-weight:600; margin:0 0 4px; letter-spacing:-0.01em; }
+  .sub { color:var(--ink2); margin:0 0 40px; font-size:15px; }
+  h2 { font-size:20px; font-weight:600; margin:48px 0 12px; padding-top:20px; border-top:1px solid var(--rule); }
+  h3 { font-size:16px; font-weight:600; margin:28px 0 8px; }
+  p { margin:0 0 14px; }
+  code { font:13.5px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+         background:#f1efe8; padding:1px 5px; border-radius:3px; }
+  pre { background:#f1efe8; padding:14px 16px; border-radius:6px; overflow-x:auto;
+        font:13px/1.6 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; margin:0 0 16px; }
+  table { border-collapse:collapse; width:100%; margin:0 0 20px; font-size:14.5px; }
+  th, td { text-align:left; padding:8px 12px 8px 0; border-bottom:1px solid var(--rule); vertical-align:top; }
+  th { font-weight:600; color:var(--ink2); font-size:13px; text-transform:uppercase; letter-spacing:0.04em; }
+  td.num { font:13.5px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; white-space:nowrap; }
+  figure { margin:24px 0 32px; }
+  figcaption { font-size:13.5px; color:var(--ink2); margin-top:10px; }
+  .note { border-left:3px solid #BA7517; background:#faeeda; padding:12px 16px; margin:0 0 18px; font-size:14.5px; }
+  .note strong { font-weight:600; }
+  .key { border-left:3px solid #0F6E56; background:#e1f5ee; padding:12px 16px; margin:0 0 18px; font-size:14.5px; }
+  svg text { font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+  .t  { font-size:14px; fill:#3d3d3a; }
+  .ts { font-size:12px; fill:#5f5e5a; }
+  .th { font-size:14px; font-weight:500; fill:#2c2c2a; }
+  .c-gray  rect { fill:#F1EFE8; stroke:#888780; }
+  .c-coral rect { fill:#FAECE7; stroke:#D85A30; }
+  .c-teal  rect { fill:#E1F5EE; stroke:#1D9E75; }
+  .c-red   rect { fill:#FCEBEB; stroke:#E24B4A; }
+  .c-coral .th { fill:#712B13; } .c-coral .ts { fill:#993C1D; }
+  .c-teal  .th { fill:#085041; } .c-teal  .ts { fill:#0F6E56; }
+  .c-red   .th { fill:#791F1F; } .c-red   .ts { fill:#A32D2D; }
+  .c-gray  .th { fill:#2C2C2A; } .c-gray  .ts { fill:#5F5E5A; }
+  .arr { stroke:#888780; stroke-width:1.5; fill:none; }
+  @media print {
+    body { padding:0; background:#fff; }
+    h2 { page-break-after:avoid; } figure { page-break-inside:avoid; }
+    table { page-break-inside:avoid; }
+  }
+</style>
+<main>
+
+<h1>Injection lock follower — feedback scheme v4</h1>
+<p class="sub">Supersedes the v3 flowchart. Reflects the firmware after the <code>Channel</code> refactor,
+the reordered <code>bumpUp</code> exits, and the fb_sign-aware handoff geometry.</p>
+
+<h2>Notation</h2>
+
+<p>All algorithm state lives in a <code>Channel</code> struct; there is one instance per laser and a
+single copy of each control function taking <code>Channel&amp;</code>. Names below are the struct members.</p>
+
+<table>
+  <tr><th>Name</th><th>Meaning</th></tr>
+  <tr><td class="num">dacCode</td><td>Absolute DAC code currently driven. Changed only through <code>setDac()</code>.</td></tr>
+  <tr><td class="num">goodCode</td><td>Last DAC code at which the lock was confirmed good.</td></tr>
+  <tr><td class="num">refHeight</td><td>Setpoint peak height, measured at init and reset by the “update peaks” button.</td></tr>
+  <tr><td class="num">refStd</td><td>Spread of that height, measured the same way over <code>STATS_SCANS</code> scans.</td></tr>
+  <tr><td class="num">fwhm</td><td>Half-width in DAC LSBs, from the SPC fit.</td></tr>
+  <tr><td class="num">fb.m</td><td>Slope from the SPC fit, measured on the fbSign flank.</td></tr>
+  <tr><td class="num">fbSign</td><td>+1 slower, −1 xbeam. Points at the gentle flank. See below.</td></tr>
+  <tr><td class="num">buf</td><td>Running history of cluster-averaged peak heights, one entry per scan.</td></tr>
+</table>
+
+<h3>Typical parameters</h3>
+
+<table>
+  <tr><th>Quantity</th><th>Value</th><th>In current</th></tr>
+  <tr><td>DAC resolution</td><td class="num">1 LSB</td><td class="num">1.1 µA</td></tr>
+  <tr><td>fwhm</td><td class="num">300–400 LSB</td><td class="num">330–440 µA</td></tr>
+  <tr><td>bump step (bump_thresh 0.05)</td><td class="num">18 LSB</td><td class="num">20 µA</td></tr>
+  <tr><td>relock clamp (2 · fwhm)</td><td class="num">700 LSB</td><td class="num">770 µA</td></tr>
+  <tr><td>recovery step</td><td class="num">27 LSB</td><td class="num">30 µA</td></tr>
+  <tr><td>losing_meanThresh</td><td class="num">0.95</td><td>—</td></tr>
+  <tr><td>lost_meanThresh</td><td class="num">0.25</td><td>—</td></tr>
+  <tr><td>relock_thresh</td><td class="num">0.95</td><td>—</td></tr>
+</table>
+
+<h2>The fb_sign invariant</h2>
+
+<div class="key">
+<strong>fbSign names the gentle flank.</strong> The spectral purity curve is asymmetric: the slower
+falls off sharply on the low-current side and gently on the high side; the xbeam is the reverse.
+<code>getSlope</code> walks from the peak in the fbSign direction, so <code>fb.m</code> is always
+measured on the gentle flank — negative for the slower, positive for the xbeam.
+</div>
+
+<p>Everything directional follows from that one fact. <code>relock</code> extrapolates along the gentle
+slope, so it can only travel in the <code>−fbSign</code> direction, and therefore can only approach the
+peak from the fbSign side. <strong>Every path that hands off to relock must leave the channel on that
+side.</strong> That constraint fixes the recovery start offset, the recovery sweep direction, the lost-state
+bump, the overshoot retreat, and the lost jump-back.</p>
+
+<table>
+  <tr><th></th><th>slower (+1)</th><th>xbeam (−1)</th></tr>
+  <tr><td>Sharp flank</td><td>low current</td><td>high current</td></tr>
+  <tr><td>Gentle flank</td><td>high current</td><td>low current</td></tr>
+  <tr><td>Sign of <code>fb.m</code></td><td class="num">negative</td><td class="num">positive</td></tr>
+  <tr><td>relock travels</td><td>down</td><td>up</td></tr>
+  <tr><td>relock accepts</td><td class="num">dx &lt; 0</td><td class="num">dx &gt; 0</td></tr>
+  <tr><td>Recovery sweeps</td><td>down</td><td>up</td></tr>
+</table>
+
+<p>All of those collapse to the single test <code>dx * fbSign &lt; 0</code> and the single direction
+<code>−fbSign</code>. Note that <code>bumpUp</code> deliberately does <em>not</em> consult fbSign: in
+normal operation both channels need the current bumped up, and the probe determines direction empirically.</p>
+
+<h2>The role of goodCode</h2>
+
+<p><code>goodCode</code> is the only persistent memory of where the lock actually was. It is written on every
+success — in <code>bumpUp</code>, <code>relock</code> and <code>recover</code> — and read back in three places:</p>
+
+<ul>
+<li>Recovery starts its sweep at <code>goodCode + fbSign·(n+1)·fwhm</code>, so a stale value sends the
+sweep to the wrong region entirely.</li>
+<li>A recovery sweep that reaches the rail without finding the peak parks the DAC back at
+<code>goodCode</code>, rather than abandoning the laser at zero or full scale.</li>
+<li>The lost branch of <code>bumpUp</code> jumps to <code>goodCode + fbSign·fwhm</code>.</li>
+</ul>
+
+<div class="note">
+<strong>Historical note.</strong> <code>goodCode</code> was previously overwritten after every SPC run with
+<code>Slope.x0</code>, which was a sweep-relative step offset rather than an absolute DAC code. It therefore
+landed near the bottom of the DAC range, and recovery swept away from the peak from a nonsensical starting
+point. Recovery almost certainly never succeeded before this was fixed.
+</div>
+
+<h2>Figure 1 — serviceChannel</h2>
+
+<p>Runs once per channel per scan, called from <code>feedbackWrapper</code>. Tests are in priority order;
+the first match wins and the rest are skipped.</p>
+
+<figure>
+<svg width="100%" viewBox="0 0 680 440" role="img"><title>serviceChannel decision flow</title><desc>Per-scan decision tree: failed goes to recover, below lost threshold goes to the lost branch, losing or noisy goes to bumpUp, otherwise locked.</desc>
+<defs><marker id="a1" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<g class="c-gray"><rect x="170" y="40" width="300" height="44" rx="8" stroke-width="0.5"/>
+<text class="th" x="320" y="62" text-anchor="middle" dominant-baseline="central">Scan acquired, buffer updated</text></g>
+<line x1="320" y1="84" x2="320" y2="112" class="arr" marker-end="url(#a1)"/>
+<g class="c-gray"><rect x="170" y="114" width="300" height="56" rx="8" stroke-width="0.5"/>
+<text class="th" x="320" y="134" text-anchor="middle" dominant-baseline="central">Channel already failed?</text>
+<text class="ts" x="320" y="152" text-anchor="middle" dominant-baseline="central">ch.fail is set</text></g>
+<line x1="470" y1="142" x2="488" y2="142" class="arr" marker-end="url(#a1)"/>
+<g class="c-coral"><rect x="490" y="114" width="150" height="56" rx="8" stroke-width="0.5"/>
+<text class="th" x="565" y="134" text-anchor="middle" dominant-baseline="central">recover</text>
+<text class="ts" x="565" y="152" text-anchor="middle" dominant-baseline="central">Sweep for the peak</text></g>
+<line x1="320" y1="170" x2="320" y2="198" class="arr" marker-end="url(#a1)"/>
+<g class="c-gray"><rect x="170" y="200" width="300" height="56" rx="8" stroke-width="0.5"/>
+<text class="th" x="320" y="220" text-anchor="middle" dominant-baseline="central">Below the lost threshold?</text>
+<text class="ts" x="320" y="238" text-anchor="middle" dominant-baseline="central">mean &lt; lost_meanThresh · refHeight</text></g>
+<line x1="470" y1="228" x2="488" y2="228" class="arr" marker-end="url(#a1)"/>
+<g class="c-coral"><rect x="490" y="200" width="150" height="56" rx="8" stroke-width="0.5"/>
+<text class="th" x="565" y="220" text-anchor="middle" dominant-baseline="central">Lost branch</text>
+<text class="ts" x="565" y="238" text-anchor="middle" dominant-baseline="central">Bump ±FWHM, relock</text></g>
+<line x1="320" y1="256" x2="320" y2="284" class="arr" marker-end="url(#a1)"/>
+<g class="c-gray"><rect x="170" y="286" width="300" height="56" rx="8" stroke-width="0.5"/>
+<text class="th" x="320" y="306" text-anchor="middle" dominant-baseline="central">Losing height, or bouncing?</text>
+<text class="ts" x="320" y="324" text-anchor="middle" dominant-baseline="central">mean below losing, or std above threshold</text></g>
+<line x1="470" y1="314" x2="488" y2="314" class="arr" marker-end="url(#a1)"/>
+<g class="c-coral"><rect x="490" y="286" width="150" height="56" rx="8" stroke-width="0.5"/>
+<text class="th" x="565" y="306" text-anchor="middle" dominant-baseline="central">bumpUp</text>
+<text class="ts" x="565" y="324" text-anchor="middle" dominant-baseline="central">Probe, then climb</text></g>
+<line x1="320" y1="342" x2="320" y2="370" class="arr" marker-end="url(#a1)"/>
+<g class="c-teal"><rect x="170" y="372" width="300" height="44" rx="8" stroke-width="0.5"/>
+<text class="th" x="320" y="394" text-anchor="middle" dominant-baseline="central">Locked — no action this iteration</text></g>
+</svg>
+<figcaption>Figure 1. The digilock line is checked on entry; if it is low the function returns immediately
+and nothing moves. A failed scan acquisition means this is not called at all — the DAC simply holds.</figcaption>
+</figure>
+
+<h2>Figure 2 — bumpUp</h2>
+
+<p>The search stage. A probe establishes which way the signal improves, then a staircase of 5%-FWHM steps
+climbs in that direction, up to ten times.</p>
+
+<figure>
+<svg width="100%" viewBox="0 0 680 590" role="img"><title>bumpUp probe and staircase</title><desc>bumpUp probes one step upward to find the slope direction, then climbs, exiting on success, on falling below the lost threshold, or on passing the maximum.</desc>
+<defs><marker id="a2" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<g class="c-gray"><rect x="170" y="40" width="300" height="56" rx="8" stroke-width="0.5"/>
+<text class="th" x="320" y="60" text-anchor="middle" dominant-baseline="central">Probe one step upward</text>
+<text class="ts" x="320" y="78" text-anchor="middle" dominant-baseline="central">Measure, then return to start</text></g>
+<line x1="320" y1="96" x2="320" y2="124" class="arr" marker-end="url(#a2)"/>
+<g class="c-gray"><rect x="170" y="126" width="300" height="56" rx="8" stroke-width="0.5"/>
+<text class="th" x="320" y="146" text-anchor="middle" dominant-baseline="central">Set effective_sign</text>
+<text class="ts" x="320" y="164" text-anchor="middle" dominant-baseline="central">+1 if signal rose, −1 if it fell</text></g>
+<line x1="320" y1="182" x2="320" y2="210" class="arr" marker-end="url(#a2)"/>
+<g class="c-gray"><rect x="170" y="212" width="300" height="56" rx="8" stroke-width="0.5"/>
+<text class="th" x="320" y="232" text-anchor="middle" dominant-baseline="central">Take one step</text>
+<text class="ts" x="320" y="250" text-anchor="middle" dominant-baseline="central">dacCode += effective_sign · step</text></g>
+<line x1="320" y1="268" x2="320" y2="296" class="arr" marker-end="url(#a2)"/>
+<g class="c-gray"><rect x="170" y="298" width="300" height="56" rx="8" stroke-width="0.5"/>
+<text class="th" x="320" y="318" text-anchor="middle" dominant-baseline="central">Back above the setpoint?</text>
+<text class="ts" x="320" y="336" text-anchor="middle" dominant-baseline="central">mean &gt; losing_meanThresh · refHeight</text></g>
+<line x1="470" y1="326" x2="488" y2="326" class="arr" marker-end="url(#a2)"/>
+<g class="c-teal"><rect x="490" y="298" width="150" height="56" rx="8" stroke-width="0.5"/>
+<text class="th" x="565" y="318" text-anchor="middle" dominant-baseline="central">Success</text>
+<text class="ts" x="565" y="336" text-anchor="middle" dominant-baseline="central">Save goodCode</text></g>
+<line x1="320" y1="354" x2="320" y2="372" class="arr" marker-end="url(#a2)"/>
+<g class="c-gray"><rect x="170" y="374" width="300" height="56" rx="8" stroke-width="0.5"/>
+<text class="th" x="320" y="394" text-anchor="middle" dominant-baseline="central">Fell off the peak?</text>
+<text class="ts" x="320" y="412" text-anchor="middle" dominant-baseline="central">mean &lt; lost_meanThresh · refHeight</text></g>
+<line x1="470" y1="402" x2="488" y2="402" class="arr" marker-end="url(#a2)"/>
+<g class="c-coral"><rect x="490" y="374" width="150" height="56" rx="8" stroke-width="0.5"/>
+<text class="th" x="565" y="394" text-anchor="middle" dominant-baseline="central">Lost</text>
+<text class="ts" x="565" y="412" text-anchor="middle" dominant-baseline="central">Jump to gentle</text></g>
+<line x1="320" y1="430" x2="320" y2="448" class="arr" marker-end="url(#a2)"/>
+<g class="c-gray"><rect x="170" y="450" width="300" height="56" rx="8" stroke-width="0.5"/>
+<text class="th" x="320" y="470" text-anchor="middle" dominant-baseline="central">Passed the maximum?</text>
+<text class="ts" x="320" y="488" text-anchor="middle" dominant-baseline="central">mean &lt; start_val</text></g>
+<line x1="470" y1="478" x2="488" y2="478" class="arr" marker-end="url(#a2)"/>
+<g class="c-coral"><rect x="490" y="450" width="150" height="56" rx="8" stroke-width="0.5"/>
+<text class="th" x="565" y="470" text-anchor="middle" dominant-baseline="central">Overshot</text>
+<text class="ts" x="565" y="488" text-anchor="middle" dominant-baseline="central">Retreat if needed</text></g>
+<line x1="320" y1="506" x2="320" y2="524" class="arr" marker-end="url(#a2)"/>
+<g class="c-coral"><rect x="170" y="526" width="300" height="44" rx="8" stroke-width="0.5"/>
+<text class="th" x="320" y="548" text-anchor="middle" dominant-baseline="central">Repeat up to 10, else hand to relock</text></g>
+</svg>
+<figcaption>Figure 2. Exit tests are in this order deliberately. With lost tested after passed-maximum it
+could never fire, because <code>start_val</code> is always at or above the lost threshold, so any reading
+low enough to be “lost” is also below <code>start_val</code>.</figcaption>
+</figure>
+
+<h3>The two handoffs</h3>
+
+<p>Both exits at the bottom of the staircase must leave the channel on the gentle flank, because that is the
+only side relock can work from.</p>
+
+<pre>lost:       setDac(ch, ch.goodCode + ch.fbSign * ch.fwhm);
+
+overshoot:  if (effective_sign != ch.fbSign)
+              setDac(ch, ch.dacCode - effective_sign * 0.25 * ch.fwhm);</pre>
+
+<p>The retreat is skipped when <code>effective_sign == fbSign</code>, because in that case overshooting
+already left the channel on the gentle side — retreating would push it back across onto the sharp side.</p>
+
+<table>
+  <tr><th>Channel</th><th>effective_sign</th><th>Retreat?</th><th>Ends up</th><th>relock travels</th></tr>
+  <tr><td>slower</td><td class="num">+1</td><td>no</td><td>above peak, gentle</td><td>down</td></tr>
+  <tr><td>slower</td><td class="num">−1</td><td>yes, upward</td><td>above peak, gentle</td><td>down</td></tr>
+  <tr><td>xbeam</td><td class="num">+1</td><td>yes, downward</td><td>below peak, gentle</td><td>up</td></tr>
+  <tr><td>xbeam</td><td class="num">−1</td><td>no</td><td>below peak, gentle</td><td>up</td></tr>
+</table>
+
+<h2>Figure 3 — relock and recover</h2>
+
+<figure>
+<svg width="100%" viewBox="0 0 680 460" role="img"><title>relock and recover subroutines</title><desc>relock computes a clamped linear correction accepted only in the minus fbSign direction; recover sweeps from an offset start across the DAC range looking for the peak.</desc>
+<defs><marker id="a3" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<g class="c-coral"><rect x="40" y="40" width="280" height="56" rx="8" stroke-width="0.5"/>
+<text class="th" x="180" y="60" text-anchor="middle" dominant-baseline="central">relock: compute correction</text>
+<text class="ts" x="180" y="78" text-anchor="middle" dominant-baseline="central">relock_thresh · (ref − mean) / m</text></g>
+<line x1="180" y1="96" x2="180" y2="124" class="arr" marker-end="url(#a3)"/>
+<g class="c-coral"><rect x="40" y="126" width="280" height="56" rx="8" stroke-width="0.5"/>
+<text class="th" x="180" y="146" text-anchor="middle" dominant-baseline="central">Clamp to ±2 · FWHM</text>
+<text class="ts" x="180" y="164" text-anchor="middle" dominant-baseline="central">Fit is linear, plateau is not</text></g>
+<line x1="180" y1="182" x2="180" y2="210" class="arr" marker-end="url(#a3)"/>
+<g class="c-coral"><rect x="40" y="212" width="280" height="56" rx="8" stroke-width="0.5"/>
+<text class="th" x="180" y="232" text-anchor="middle" dominant-baseline="central">Check direction</text>
+<text class="ts" x="180" y="250" text-anchor="middle" dominant-baseline="central">Accept only if dx · fbSign &lt; 0</text></g>
+<line x1="180" y1="268" x2="180" y2="296" class="arr" marker-end="url(#a3)"/>
+<g class="c-coral"><rect x="40" y="298" width="280" height="56" rx="8" stroke-width="0.5"/>
+<text class="th" x="180" y="318" text-anchor="middle" dominant-baseline="central">Move and re-measure</text>
+<text class="ts" x="180" y="336" text-anchor="middle" dominant-baseline="central">Recurse up to 5 times</text></g>
+<line x1="180" y1="354" x2="180" y2="382" class="arr" marker-end="url(#a3)"/>
+<g class="c-teal"><rect x="40" y="384" width="280" height="56" rx="8" stroke-width="0.5"/>
+<text class="th" x="180" y="404" text-anchor="middle" dominant-baseline="central">Success</text>
+<text class="ts" x="180" y="422" text-anchor="middle" dominant-baseline="central">Save goodCode, else set ch.fail</text></g>
+<g class="c-coral"><rect x="360" y="40" width="280" height="56" rx="8" stroke-width="0.5"/>
+<text class="th" x="500" y="60" text-anchor="middle" dominant-baseline="central">recover: start offset</text>
+<text class="ts" x="500" y="78" text-anchor="middle" dominant-baseline="central">goodCode + fbSign · (n+1) · FWHM</text></g>
+<line x1="500" y1="96" x2="500" y2="124" class="arr" marker-end="url(#a3)"/>
+<g class="c-coral"><rect x="360" y="126" width="280" height="56" rx="8" stroke-width="0.5"/>
+<text class="th" x="500" y="146" text-anchor="middle" dominant-baseline="central">Sweep toward −fbSign</text>
+<text class="ts" x="500" y="164" text-anchor="middle" dominant-baseline="central">30 µA steps, 50 ms apart</text></g>
+<line x1="500" y1="182" x2="500" y2="210" class="arr" marker-end="url(#a3)"/>
+<g class="c-coral"><rect x="360" y="212" width="280" height="56" rx="8" stroke-width="0.5"/>
+<text class="th" x="500" y="232" text-anchor="middle" dominant-baseline="central">Watch for the peak</text>
+<text class="ts" x="500" y="250" text-anchor="middle" dominant-baseline="central">max &gt; losing_meanThresh · ref</text></g>
+<line x1="500" y1="268" x2="500" y2="296" class="arr" marker-end="url(#a3)"/>
+<g class="c-teal"><rect x="360" y="298" width="280" height="56" rx="8" stroke-width="0.5"/>
+<text class="th" x="500" y="318" text-anchor="middle" dominant-baseline="central">Found it</text>
+<text class="ts" x="500" y="336" text-anchor="middle" dominant-baseline="central">Clear fail, save goodCode</text></g>
+<line x1="500" y1="354" x2="500" y2="382" class="arr" marker-end="url(#a3)"/>
+<g class="c-red"><rect x="360" y="384" width="280" height="56" rx="8" stroke-width="0.5"/>
+<text class="th" x="500" y="404" text-anchor="middle" dominant-baseline="central">Hit the rail</text>
+<text class="ts" x="500" y="422" text-anchor="middle" dominant-baseline="central">Latch at limit, revert goodCode</text></g>
+</svg>
+<figcaption>Figure 3. relock refuses to run at all on a degenerate SPC fit (<code>m = 0</code>, non-finite
+<code>m</code>, or <code>fwhm = 0</code>), setting <code>ch.fail</code> so recovery takes over instead of
+dividing by zero.</figcaption>
+</figure>
+
+<h2>Worked examples</h2>
+
+<p>Throughout: FWHM 350 LSB, step 18 LSB, peak at DAC 2048, <code>refHeight</code> 2400 counts. The losing
+threshold is 2280, the lost threshold 600. The half-height SPC fit gives |m| ≈ 1200/350 ≈ 3.43 counts per LSB,
+negative for the slower and positive for the xbeam.</p>
+
+<h3>1. Normal thermal drift — identical on both channels</h3>
+
+<p>Running mean has sagged to 2200 (0.92 of reference). <code>serviceChannel</code> sees losing-but-not-lost
+and calls <code>bumpUp</code>.</p>
+
+<table>
+  <tr><th>Step</th><th>DAC</th><th>Reading</th><th>Action</th></tr>
+  <tr><td>Probe</td><td class="num">1978</td><td class="num">2260</td><td>Rose → effective_sign = +1; return to 1960</td></tr>
+  <tr><td>1–4</td><td class="num">1978 → 2032</td><td>rising</td><td>Still below 2280, keep climbing</td></tr>
+  <tr><td>5</td><td class="num">2050</td><td class="num">2390</td><td>Above 2280 → success, goodCode = 2050</td></tr>
+</table>
+
+<p>fbSign is never consulted. Six measurements at three scans each is 18 scans, about 0.36 s at a 50 Hz ramp.</p>
+
+<h3>2. Overshoot — where the channels diverge</h3>
+
+<p>Both start at 2030 and climb past the peak to 2084, where the reading drops below <code>start_val</code>.</p>
+
+<table>
+  <tr><th></th><th>slower (+1)</th><th>xbeam (−1)</th></tr>
+  <tr><td>effective_sign vs fbSign</td><td>+1 = +1, match</td><td>+1 ≠ −1, mismatch</td></tr>
+  <tr><td>Retreat</td><td>none</td><td class="num">−88 LSB → 1996</td></tr>
+  <tr><td>Position</td><td>2084, 36 above peak</td><td>1996, 52 below peak</td></tr>
+  <tr><td>Flank</td><td>gentle</td><td>gentle</td></tr>
+  <tr><td>dx = 0.95·(2400−2250)/m</td><td class="num">−42</td><td class="num">+42</td></tr>
+  <tr><td>dx · fbSign</td><td class="num">−42 &lt; 0, accepted</td><td class="num">−42 &lt; 0, accepted</td></tr>
+  <tr><td>Lands at</td><td class="num">2042</td><td class="num">2038</td></tr>
+</table>
+
+<p>Both converge to within a few LSB of the peak, by opposite routes.</p>
+
+<h3>3. Mode hop mid-staircase</h3>
+
+<p>Signal collapses to 400 counts, below the lost threshold of 600. This is the branch the reordering made
+reachable; it had never executed before.</p>
+
+<table>
+  <tr><th></th><th>slower</th><th>xbeam</th></tr>
+  <tr><td>Jump to goodCode + fbSign·FWHM</td><td class="num">2048 + 350 = 2398</td><td class="num">2048 − 350 = 1698</td></tr>
+  <tr><td>Where that is</td><td>one FWHM up the gentle flank</td><td>one FWHM down the gentle flank</td></tr>
+  <tr><td>Expected height there</td><td class="num">≈1200</td><td class="num">≈1200</td></tr>
+  <tr><td>relock then travels</td><td>down</td><td>up</td></tr>
+</table>
+
+<h3>4. Already lost on entry</h3>
+
+<p><code>serviceChannel</code> takes its own branch, using fbSign directly rather than probing.</p>
+
+<table>
+  <tr><th></th><th>slower at 1700</th><th>xbeam at 2400</th></tr>
+  <tr><td>First bump, +fbSign·FWHM</td><td class="num">1700 + 350 = 2050</td><td class="num">2400 − 350 = 2050</td></tr>
+  <tr><td>If still below 600, −2·fbSign·FWHM</td><td class="num">2050 − 700 = 1350</td><td class="num">2050 + 700 = 2750</td></tr>
+  <tr><td>If that also fails</td><td>ch.fail → recover next pass</td><td>ch.fail → recover next pass</td></tr>
+</table>
+
+<h3>5. Recovery sweep, first attempt</h3>
+
+<p><code>nRecoveryAttempts</code> is 1 after the increment, so the offset is 2·FWHM.</p>
+
+<table>
+  <tr><th></th><th>slower</th><th>xbeam</th></tr>
+  <tr><td>Start</td><td class="num">2048 + 700 = 2748</td><td class="num">2048 − 700 = 1348</td></tr>
+  <tr><td>Sweeps</td><td>down, 27 LSB steps</td><td>up, 27 LSB steps</td></tr>
+  <tr><td>Steps to reach 2048</td><td class="num">≈26</td><td class="num">≈26</td></tr>
+  <tr><td>Rail if nothing found</td><td class="num">0</td><td class="num">4095</td></tr>
+</table>
+
+<p>Each step costs 50 ms plus four scans, so a successful first-attempt recovery is roughly
+26 × (50 ms + 80 ms) ≈ 3.4 s. A full failed sweep from 2748 to the rail is about 100 steps, or 13 s, during
+which the main loop is blocked and the host sees nothing.</p>
+
+<h2>Timing summary</h2>
+
+<table>
+  <tr><th>Operation</th><th>Scans</th><th>At 50 Hz</th></tr>
+  <tr><td>One servo iteration, locked</td><td class="num">1</td><td class="num">20 ms</td></tr>
+  <tr><td>One <code>getIterationMean</code></td><td class="num">3</td><td class="num">60 ms</td></tr>
+  <tr><td>bumpUp, successful in 5 steps</td><td class="num">18</td><td class="num">0.36 s</td></tr>
+  <tr><td>bumpUp, all 10 steps unsuccessful</td><td class="num">33</td><td class="num">0.66 s</td></tr>
+  <tr><td>relock, one pass</td><td class="num">6</td><td class="num">0.12 s</td></tr>
+  <tr><td>relock, 5 recursions</td><td class="num">30</td><td class="num">0.6 s</td></tr>
+  <tr><td>Recovery, found at 26 steps</td><td>—</td><td class="num">≈3.4 s</td></tr>
+  <tr><td>Recovery, full sweep to rail</td><td>—</td><td class="num">≈13 s</td></tr>
+</table>
+
+<h2>Known weaknesses</h2>
+
+<p><strong>The retreat fraction is not self-consistent.</strong> The 0.25·FWHM retreat reliably crosses the peak
+only because the overshoot is at most one 18 LSB step while the retreat is 87 LSB. That relationship depends on
+<code>bump_thresh</code> staying near 0.05. At 0.25 the step would itself be 87 LSB and the retreat would no
+longer be guaranteed to cross. Expressing the retreat as a multiple of the step rather than of the FWHM would
+close this.</p>
+
+<p><strong>Recovery blocks the main loop.</strong> A full failed sweep holds the loop for around 13 s, during
+which no commands are serviced and no traces are sent. The host cannot distinguish this from a hang.</p>
+
+<p><strong>Peak height is a weak discriminant.</strong> It responds to FP alignment, photodiode gain and master
+power as much as to injection current, and at the top of the plateau it carries no sign information at all —
+which is the reason this search machinery has to exist. A beatnote detector or a dither-and-demodulate scheme
+would supply a true bipolar error signal and allow most of this state machine to be replaced by an integrator.</p>
+
+<p><strong>The lost branch of bumpUp is newly reachable.</strong> It was written, revised and carried across
+several firmware versions without ever executing. Treat it as new code rather than as restored behaviour.</p>
+
+</main>

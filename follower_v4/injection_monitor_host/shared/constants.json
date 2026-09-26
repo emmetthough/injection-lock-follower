@@ -1,0 +1,27 @@
+{
+  "_comment": [
+    "Single source of truth for values that MUST agree between the firmware",
+    "and the host. A mismatch is silent and corrupting -- N above all, where a",
+    "disagreement misframes every trace.",
+    "",
+    "Edit this file, run tools/gen_constants.py, commit both generated files.",
+    "Never edit firmware/constants.h or injection_monitor/constants.py.",
+    "",
+    "Values transcribed from injection_follower_v3.ino as received."
+  ],
+  "shared": {
+    "N":              {"value": 500,  "type": "int", "ino_line": 8,  "doc": "Samples per scan. The trace block is exactly 2*N raw bytes."},
+    "NUM_PEAKS":      {"value": 20,   "type": "int", "ino_line": 26, "doc": "Max peaks reported per channel in a peaks block."},
+    "MAX_CLUSTERS":   {"value": 3,    "type": "int", "ino_line": 31, "doc": "Max tracked clusters per channel. Bounds tracking block length."},
+    "ADC_BITS":       {"value": 12,   "type": "int", "ino_line": null, "doc": "ADC resolution. The host validates trace payloads with it."},
+    "DAC_MAX":        {"value": 4095, "type": "int", "ino_line": null, "doc": "Full-scale DAC code."},
+    "COMMAND_BUFFER": {"value": 64,   "type": "int", "ino_line": null, "doc": "Firmware command buffer; longer lines are discarded with a [WARN]."}
+  },
+  "firmware_only": {
+    "MAX_SCANS":    {"value": 100, "type": "int", "ino_line": 27, "doc": "Scans averaged during initialisation."},
+    "HIGH_THRESH":  {"value": 800, "type": "int", "ino_line": 23, "doc": "Slower/high peak discrimination threshold, ADC counts."},
+    "LOW_THRESH":   {"value": 400, "type": "int", "ino_line": 24, "doc": "Xbeam/low peak discrimination threshold, ADC counts."},
+    "NOISE_THRESH": {"value": 100, "type": "int", "ino_line": 28, "doc": "Minimum prominence for a peak, ADC counts."},
+    "CLUSTER_GAP":  {"value": 75,  "type": "int", "ino_line": 30, "doc": "Max sample separation within one cluster."}
+  }
+}

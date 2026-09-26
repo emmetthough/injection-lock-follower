@@ -1,0 +1,7 @@
+**/__pycache__/
+CAMOutputs/
+old/
+follower_v3/unorganized/
+follower_v4/old/
+**.DS_Store
+**.ipynb_checkpoints
